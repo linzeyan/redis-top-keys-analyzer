@@ -1,0 +1,195 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: zigbuild
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: zigbuild
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: zigbuild
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: zigbuild
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            build: cargo
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            build: cargo
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: cargo
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            build: cargo
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Zig
+        if: matrix.build == 'zigbuild'
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.13.0"
+
+      - name: Install cargo-zigbuild
+        if: matrix.build == 'zigbuild'
+        run: cargo install --locked --force cargo-zigbuild
+
+      - name: Prepare artifact vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARGET="${{ matrix.target }}"
+          PROJECT="redis-top-keys-analyzer"
+
+          case "$TARGET" in
+            *apple-darwin*)
+              OS_LABEL="macos"
+              ;;
+            *pc-windows*)
+              OS_LABEL="windows"
+              ;;
+            *linux-musl*)
+              OS_LABEL="linux_musl"
+              ;;
+            *linux-gnu*)
+              OS_LABEL="linux_gnu"
+              ;;
+            *)
+              OS_LABEL="$TARGET"
+              ;;
+          esac
+
+          case "$TARGET" in
+            x86_64*)
+              ARCH_LABEL="x86_64"
+              ;;
+            aarch64*)
+              ARCH_LABEL="arm64"
+              ;;
+            *)
+              ARCH_LABEL="${TARGET%%-*}"
+              ;;
+          esac
+
+          if [[ "$TARGET" == *"windows"* ]]; then
+            BIN_EXT=".exe"
+            ARCHIVE_EXT=".zip"
+          else
+            BIN_EXT=""
+            ARCHIVE_EXT=".tar.gz"
+          fi
+
+          ARCHIVE_BASENAME="${PROJECT}_${VERSION}_${OS_LABEL}_${ARCH_LABEL}"
+
+          {
+            echo "ARCHIVE_BASENAME=$ARCHIVE_BASENAME"
+            echo "ARCHIVE_EXT=$ARCHIVE_EXT"
+            echo "BIN_EXT=$BIN_EXT"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.build }}" == "zigbuild" ]]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/redis-top-keys-analyzer${BIN_EXT}"
+          if [[ ! -f "$BIN" ]]; then
+            BIN="target/zigbuild/${{ matrix.target }}/release/redis-top-keys-analyzer${BIN_EXT}"
+          fi
+          if [[ ! -f "$BIN" ]]; then
+            echo "Binary not found for ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$BIN" "dist/redis-top-keys-analyzer${BIN_EXT}"
+          tar -czf "dist/${ARCHIVE_BASENAME}${ARCHIVE_EXT}" -C dist "redis-top-keys-analyzer${BIN_EXT}"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/redis-top-keys-analyzer.exe"
+          if (-Not (Test-Path $bin)) {
+            $bin = "target/zigbuild/${{ matrix.target }}/release/redis-top-keys-analyzer.exe"
+          }
+          if (-Not (Test-Path $bin)) {
+            throw "Binary not found for ${{ matrix.target }}"
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $bin "dist/redis-top-keys-analyzer.exe"
+          Compress-Archive -Path "dist/redis-top-keys-analyzer.exe" -DestinationPath "dist/$env:ARCHIVE_BASENAME$env:ARCHIVE_EXT" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ env.ARCHIVE_BASENAME }}${{ env.ARCHIVE_EXT }}
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
